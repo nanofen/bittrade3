@@ -98,6 +98,67 @@ class Socket_PyBotters_BitBank():
         response = await self.send()
         print(response)
 
+    # 信用取引用メソッド
+    async def margin_buy_in(self, price, qty):
+        """
+        信用取引での買い建て（ロング）
+        """
+        self.order_create(side="buy",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="long"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_sell_in(self, price, qty):
+        """
+        信用取引での売り建て（ショート）
+        """
+        self.order_create(side="sell",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="short"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_buy_out(self, price, qty):
+        """
+        信用取引での買い決済（ショートポジションの決済）
+        """
+        self.order_create(side="buy",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="short"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_sell_out(self, price, qty):
+        """
+        信用取引での売り決済（ロングポジションの決済）
+        """
+        self.order_create(side="sell",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="long"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
     async def order_cancel(self, order_id):
         self._order_cancel(order_id=order_id, pair=self.SYMBOL)
         response = await self.send()
@@ -205,7 +266,7 @@ class Socket_PyBotters_BitBank():
     # REST API(Account Data Endpoints)
     # ------------------------------------------------ #
 
-    def order_create(self, side, pair, order_type, qty, price='', post_only='', trigger_price=''):
+    def order_create(self, side, pair, order_type, qty, price='', post_only='', trigger_price='', position_side=''):
         target_path = '/user/spot/order'
         params = {
                     'side': side,
@@ -220,6 +281,8 @@ class Socket_PyBotters_BitBank():
             params['post_only'] = post_only
         if len(str(trigger_price)) > 0:
             params['trigger_price'] = trigger_price
+        if len(str(position_side)) > 0:
+            params['position_side'] = position_side
 
         self.set_request(method='POST', access_modifiers='private',
                          target_path=target_path, params=params)
