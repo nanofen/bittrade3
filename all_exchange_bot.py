@@ -1,0 +1,485 @@
+import asyncio
+import json
+import traceback
+import sys
+import numpy as np
+import pandas as pd
+import datetime
+import os
+import time
+import pickle
+
+import pybotters
+import yfinance as yf
+import bybitbot_base
+from socket_bitbank_pybotters import Socket_PyBotters_BitBank
+from socket_bybit_pybotters import Socket_PyBotters_Bybit
+from socket_gmocoin_pybotters import Socket_PyBotters_GMOCoin
+from get_logger import get_custom_logger
+import warnings
+warnings.simplefilter('ignore')
+
+
+class ArbitrageBot(bybitbot_base.BybitBotBase):
+    # User can ues MAX_DATA_CAPACITY to control memory usage.
+    open_time_old = 0
+
+    # ---------------------------------------- #
+    # init
+    # ---------------------------------------- #
+    def __init__(self, keys, prod, log_level="INFO"):
+        super().__init__()
+        self.keys = keys
+
+        print(self.keys)
+
+        self.bybit = Socket_PyBotters_Bybit(self.keys, prod=prod)
+        self.bybit.SYMBOL = 'BTCUSDT'
+        self.bybit.PUBLIC_CHANNELS = ['kline.1.' + self.bybit.SYMBOL,
+                                      'orderbook.50.' + self.bybit.SYMBOL,
+                                      # 'orderBook_200.100ms.' + self.bybit.SYMBOL,
+                                      # 'instrument_info.100ms.' + self.bybit.SYMBOL,
+                                      #'candle.1.' + self.bybit.SYMBOL,
+                                      ]
+        self.bybit.PRIVATE_CHANNELS = ["position",
+                                       "execution",
+                                       "order",
+                                       "wallet",
+                                       "greeks",]
+
+        self.gmocoin = Socket_PyBotters_GMOCoin(self.keys)
+        self.gmocoin.SYMBOL = 'BTC_JPY'
+
+        self.orderbook_check = False
+        self.execute_check = {}
+        self.df = pd.DataFrame()
+        self.trade = pd.DataFrame()
+        self.df_ohlcv = pd.DataFrame(
+            columns=["exec_date", "Open", "High", "Low", "Close", "Volume", "timestamp"]).set_index("exec_date")
+        self.df_1h_ohlcv = pd.DataFrame(
+            columns=["exec_date", "Open", "High", "Low", "Close", "Volume", "timestamp"]).set_index("exec_date")
+        self.MAX_OHLCV_CAPACITY = 60 * 60 * 1  # 1時間分
+        self.MAX_DATA_CAPACITY = 10
+        self.sum_profit = 0
+        self.sum_fee = 0
+        self.base_qty = 0.1
+        self.bitbank_info = 0
+
+
+        self.qty = self.base_qty
+        self.Debug = False
+        self.positions = {}
+        self.positions["bybit"] = {'buy': {'size': 0}, 'sell': {'size': 0}}
+        self.positions["gmocoin"] = {'buy': {'size': 0}, 'sell': {'size': 0}}
+        self.arbitrages = {}
+        self.orders = {}
+
+        self.slip_in = 0.0
+        self.slip_out = 0.0
+        self.info = {}
+        self.usdjpy ={}
+        self.orders_bitbank = []
+        self.btc_amounts = {}
+        self.offensive_mode = True
+
+
+        self.logger = get_custom_logger(log_level)
+        self.emergency_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+        self.emergency_qty_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+
+        # タスクの設定およびイベントループの開始
+        loop = asyncio.get_event_loop()
+        tasks = [
+            self.bybit.ws_run(),
+            self.gmocoin.ws_run(),
+            #self.bybit.private_ws_run(),
+            self.run()
+        ]
+
+        loop.run_until_complete(asyncio.wait(tasks))
+
+    async def get_usdjpy(self):
+        try:
+            yfdata = yf.download(tickers="JPY=X", period="1d", interval="1m", progress=False)
+            self.usdjpy["Adj Close"] = yfdata["Adj Close"][-1]
+            self.usdjpy["Close"] = yfdata["Close"][-1]
+        except Exception as e:
+            print(traceback.format_exc().strip())
+
+    async def order_check(self):
+        await self.order_list_bybit()
+        await self.order_list_gmocoin()
+
+    async def order_cancel_all(self):
+        for order in self.orders["bybit"]:
+            self.bybit.order_cancel(order_id=order["orderId"])
+        for order in self.orders["gmocoin"]:
+            await self.gmocoin.order_cancel(order_id=order["orderId"])
+        res = await self.bybit.send()
+        res = await self.gmocoin.send()
+
+    async def order_list_bybit(self):
+        try:
+            self.bybit.order_list()
+            res = await self.bybit.send()
+            if res[0]["result"]["list"] is not None:
+                self.orders["bybit"] = res[0]["result"]["list"]
+            else:
+                self.orders["bybit"] = []
+        except Exception as e:
+            print(traceback.format_exc().strip())
+
+
+    async def order_list_gmocoin(self):
+        try:
+            self.gmocoin.order_list(self.gmocoin.SYMBOL)
+            res = await self.gmocoin.send()
+            if len(res[0]["data"]) != 0:
+                self.orders["gmocoin"] = res[0]["data"]["list"]
+            else:
+                self.orders["gmocoin"] = []
+        except Exception as e:
+            print(traceback.format_exc().strip())
+
+
+    def position_check_bybit(self):
+        dt = datetime.datetime.now(datetime.timezone.utc)
+        utc_time = dt.replace(tzinfo=datetime.timezone.utc)
+        ts_now = int(utc_time.timestamp())
+        sell_pos = self.bybit.store.position.find({'symbol': self.bybit.SYMBOL, "side": "Sell"})
+        sell_pos_size = sum([float(x["size"]) for x in sell_pos])
+        if self.positions["bybit"]["sell"]["size"] != sell_pos_size:
+            self.positions["bybit"]["sell"]["symbol"] = self.bybit.SYMBOL
+            self.positions["bybit"]["sell"]["size"] = sell_pos_size
+            self.positions["bybit"]["sell"]["timestamp"] = ts_now
+        buy_pos = self.bybit.store.position.find({'symbol': self.bybit.SYMBOL, "side": "Buy"})
+        buy_pos_size = sum([float(x["size"]) for x in buy_pos])
+        if self.positions["bybit"]["buy"]["size"] != buy_pos_size:
+            self.positions["bybit"]["buy"]["symbol"] = self.bybit.SYMBOL
+            self.positions["bybit"]["buy"]["size"] = buy_pos_size
+            self.positions["bybit"]["buy"]["timestamp"] = ts_now
+
+
+    def position_check_gmocoin(self):
+        try:
+            dt = datetime.datetime.now(datetime.timezone.utc)
+            utc_time = dt.replace(tzinfo=datetime.timezone.utc)
+            ts_now = int(utc_time.timestamp())
+
+            sell_pos = self.gmocoin.store.positions.find({'symbol': self.gmocoin.SYMBOL, "side": "asks"})
+            print("sell_pos", sell_pos)
+            sell_pos_size = sum([float(x["size"]) for x in sell_pos])
+            if self.positions["gmocoin"]["sell"]["size"] != sell_pos_size:
+                self.positions["gmocoin"]["sell"]["symbol"] = self.gmocoin.SYMBOL
+                self.positions["gmocoin"]["sell"]["size"] = sell_pos_size
+                self.positions["gmocoin"]["sell"]["timestamp"] = ts_now
+            buy_pos = self.gmocoin.store.positions.find({'symbol': self.gmocoin.SYMBOL, "side": "bids"})
+            buy_pos_size = sum([float(x["size"]) for x in buy_pos])
+            if self.positions["gmocoin"]["buy"]["size"] != buy_pos_size:
+                self.positions["gmocoin"]["buy"]["symbol"] = self.gmocoin.SYMBOL
+                self.positions["gmocoin"]["buy"]["size"] = buy_pos_size
+                self.positions["gmocoin"]["buy"]["timestamp"] = ts_now
+        except Exception as e:
+            print(e)
+
+    def get_timestamp(self):
+        dt = datetime.datetime.now(datetime.timezone.utc)
+        utc_time = dt.replace(tzinfo=datetime.timezone.utc)
+        ts_now = int(utc_time.timestamp())
+        return ts_now
+    # ---------------------------------------- #
+    # bot main
+    # ---------------------------------------- #
+
+    async def run(self):
+        checkout = False
+        while True:
+
+            await self.order_check()
+            await self.order_cancel_all()
+
+            self.position_check_gmocoin()
+            print("test")
+            self.position_check_bybit()
+
+
+            await self.get_usdjpy()
+            await self.main()
+            print("test2")
+            await asyncio.sleep(1)
+
+
+    async def main(self):
+        try:
+            if self.usdjpy.get("Close") is None:
+                return True
+
+            #self.logger.info("start main...")
+            #data = self.df_ohlcv.iloc[-1]
+            ts_now = self.get_timestamp()
+            order_list = {"buy": {}, "sell": {}}
+
+            buy_order_gmocoin = self.gmocoin.store.orderbooks.find({'symbol': self.gmocoin.SYMBOL, 'side': 'bids'})
+            sell_order_gmocoin = self.gmocoin.store.orderbooks.find({'symbol': self.gmocoin.SYMBOL, 'side': 'asks'})
+            if len(buy_order_gmocoin) < 1 or len(sell_order_gmocoin) < 1:
+                self.logger.debug(f"**restart**. not enough order data {len(buy_order_gmocoin)} {len(sell_order_gmocoin)}")
+                return True
+            order_list["buy"]["gmocoin"] = {"price": float(buy_order_gmocoin[0]["price"]), "volume": float(buy_order_gmocoin[0]["size"])}
+            order_list["sell"]["gmocoin"] = {"price": float(sell_order_gmocoin[0]["price"]), "volume": float(sell_order_gmocoin[0]["size"])}
+
+            buy_order_bybit = self.bybit.store.orderbook.find({'s': self.bybit.SYMBOL, 'S': 'b'})
+            sell_order_bybit = self.bybit.store.orderbook.find({'s': self.bybit.SYMBOL, 'S': 'a'})
+            if len(buy_order_bybit) < 1 or len(sell_order_bybit) < 1:
+                self.logger.debug(f"**restart**. not enough order data {len(buy_order_bybit)} {len(sell_order_bybit)}")
+                return True
+            print(buy_order_bybit[0])
+
+            order_list["buy"]["bybit"] = {"price": float(buy_order_bybit[0]["p"]) * self.usdjpy["Close"], "volume": float(buy_order_bybit[0]["v"])}
+            order_list["sell"]["bybit"] = {"price": float(sell_order_bybit[0]["p"]) * self.usdjpy["Close"], "volume": float(sell_order_bybit[0]["v"])}
+            print(order_list)
+            buy_max = max(order_list["buy"], key=lambda k: order_list["buy"][k]['price'])
+
+            #buy_min = min(order_list["buy"].items(), key=lambda x: x[1])
+            #sell_max = max(order_list["sell"].items(), key=lambda x: x[1])
+            sell_min = max(order_list["buy"], key=lambda k: order_list["buy"][k]['price'])
+            sell_min = min(order_list["sell"].items(), key=lambda x: x[1])
+
+
+            exit()
+
+
+            #print(buy, sell)
+            #print(self.bitbank.store.ticker.find())
+            # 取引記録
+            # print(self.bitbank.store.transactions.find())
+            # 注文記録
+
+            for order in self.orders["bybit"]:
+                self.bybit.order_cancel(order_id=order["orderId"])
+            for order in self.orders["gmocoin"]:
+                await self.gmocoin.order_cancel(order_id=order["orderId"])
+            res = await self.bybit.send()
+
+            #print(bitbank_buy_order) # 0が一番上
+            #print(bitbank_sell_order) # 0が一番下
+            # in
+            # マイナスの場合 bybitのbuy値段よりbitbankのsell値段は高いことになる(inできない)
+            # プラスの場合 bybitのbuy値段よりbitbankのsell値段は低い(inできる)
+            #("in", float(buy["price"]) - float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
+            #      bitbank_sell_order[0]["size"], float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
+            #      buy["size"], buy["price"], )
+            # out
+            # マイナスの場合 bybitのsell値段よりbitbankのbuy値段は低い(inの時の利益 - 損失)
+            # ゼロの時  bybitのsell値段とbitbankのbuy値段は均衡(inの時の利益)
+            # プラスの場合 bybitのsell値段よりbitbankのbuy値段は高い(inの時の利益 + 差額利益)
+            #print("out", float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"] - float(sell["price"]),
+            #      bitbank_buy_order[0]["size"], float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"],
+            #      sell["size"], sell["price"], )
+            # bybit bitbank
+            # in
+            #  ×    〇    〇   ×
+            # 110 / 105   100 / 95
+            # 105 - 100 = 5$ ?
+            # sell pos    buy pos
+            #  〇    ×    ×  〇
+
+            # 115 / 110   115 / 110
+            # bybit 105 - 115 = -10
+            # bitbank 110 - 100 = 10
+            # 0$
+            # (105 - 100) + (110 - 115) = 0
+
+            # 130 / 125   120 / 115
+            # bybit 105 - 130 = -25
+            # bitbank 115 - 100 = 15
+            # -10$
+            # (105 - 100) + (115 - 130) = -10
+
+            # 115 / 110   120 / 115
+            # bybit 105 - 115 = -10
+            # bitbank 115 - 100 = 15
+            # 5$
+            # (105 - 100) + (115 - 115) = 5
+
+            # 売り63259.10 買い62747.62 = ~500$
+            # 買い63160.00 売り63029.99 = ~-150$
+            # = 350$
+
+
+
+            # orderが残っている場合はキャンセル
+            # return True
+            # bitbankが安いのか / bybitが高いのか？は判定できてない
+            if self.positions["gmocoin"]["size"] == 0 and self.positions["bybit"]["size"] == 0:
+                self.offensive_mode = True
+            # 最後にpositionを持ってから10分以上になったら利確モードに入る
+            if self.positions["gmocoin"]["timestamp"] + 60 * 10 < ts_now:
+                self.offensive_mode = False
+            # 条件1 初期 まだ買えるがposが安定
+            if self.offensive_mode and self.positions["gmocoin"]["size"] < self.base_qty and (self.positions["bybit"]["size"] == self.positions_bitbank["size"]):
+
+                # 一定金額以上儲からなければ参入しない
+                if float(buy_max[1]) - float(sell_min[1]) > 200:
+                    qty = float(bitbank_sell_order[0]["size"])
+                    if qty > self.base_qty - float(self.positions["gmocoin"]["size"]):
+                        qty = self.base_qty - float(self.positions["gmocoin"]["size"])
+                    await self.gmocoin.buy_in(float(bitbank_sell_order[0]["price"]), qty)
+                    get_pos_flg = False
+                    ts_now = self.get_timestamp()
+                    while True:
+                        await self.position_check_bitbank()
+                        buy_pos_size = self.positions_bitbank["size"]
+                        if buy_pos_size == 0:
+                            pass
+                        if buy_pos_size < qty:
+                            get_pos_flg = True
+                            self.positions_bitbank["price_jpy_bitbank"] = float(bitbank_sell_order[0]["price"])
+                            self.positions_bitbank["price_bitbank"] = float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"]
+                        elif buy_pos_size == qty:
+                            get_pos_flg = True
+                            self.positions_bitbank["price_jpy_bitbank"] = float(bitbank_sell_order[0]["price"])
+                            self.positions_bitbank["price_bitbank"] = float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"]
+                            break
+                        if self.get_timestamp() - ts_now > 1:
+                            break
+                        await asyncio.sleep(0.1)
+                    if not get_pos_flg:
+                        return False
+                    print("in", float(buy["price"]) - float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
+                          bitbank_sell_order[0]["size"], float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
+                          buy["size"], buy["price"], )
+
+                    #"""
+                    pos_size = buy_pos_size
+                    await self.bybit.sell_in(float(buy["price"]), pos_size)
+                    ts_now = self.get_timestamp()
+                    while True:
+                        self.position_check_bybit()
+                        sell_pos_size = self.positions_bybit["size"]
+                        if sell_pos_size == 0:
+                            pass
+                        if sell_pos_size < pos_size:
+                            self.positions_bybit["price_bybit"] = float(buy["price"])
+                        elif sell_pos_size == pos_size:
+                            self.positions_bybit["price_bybit"] = float(buy["price"])
+                            break
+                        if self.get_timestamp() - ts_now > 1:
+                            break
+                        await asyncio.sleep(0.1)
+                    return False
+                    #"""
+            # 条件2 bitbankはいっぱいだがposが不安定
+            if self.offensive_mode and self.positions_bitbank["size"] == self.base_qty and (self.positions_bybit["size"] < self.positions_bitbank["size"]):
+                pos_size = self.positions_bitbank["size"] - self.positions_bybit["size"]
+                await self.bybit.sell_in(float(buy["price"]), pos_size)
+                ts_now = self.get_timestamp()
+                while True:
+                    self.position_check_bybit()
+                    sell_pos_size = self.positions_bybit["size"]
+                    if sell_pos_size == 0:
+                        pass
+                    if sell_pos_size < pos_size:
+                        self.positions_bybit["price_bybit"] = float(buy["price"])
+                    elif sell_pos_size == pos_size:
+                        self.positions_bybit["price_bybit"] = float(buy["price"])
+                        break
+                    if self.get_timestamp() - ts_now > 1:
+                        break
+                    await asyncio.sleep(0.1)
+                return False
+            # 条件2 bitbank bybitともにいっぱい
+            if not self.offensive_mode and (self.positions_bybit["size"] > 0 or self.positions_bitbank["size"] > 0):
+                # 売る
+                if float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"] - float(sell["price"]) > 0:
+                    await self.bitbank.buy_out(float(bitbank_sell_order[0]["price"]), self.positions_bitbank["size"])
+                    base_pos_size = self.positions_bitbank["size"]
+                    sell_pos_flg = False
+                    while True:
+                        await self.position_check_bitbank()
+                        pos_size = self.positions_bitbank["size"]
+                        if pos_size == base_pos_size:
+                            pass
+                        if pos_size == 0:
+                            sell_pos_flg = True
+                            break
+                        elif pos_size < base_pos_size:
+                            sell_pos_flg = True
+                            break
+                        if self.get_timestamp() - ts_now > 1:
+                            break
+                        await asyncio.sleep(0.1)
+                    if not sell_pos_flg:
+                        return False
+                    print("out", float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"] - float(sell["price"]),
+                          bitbank_buy_order[0]["size"], float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"],
+                          sell["size"], sell["price"], )
+
+                    await self.bybit.buy_out(float(sell["price"]), self.positions_bybit["size"] - pos_size)
+
+            now_data = {"timestamp": ts_now,
+                        "in_diff": float(buy["price"]) - float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
+                        "out_diff": float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"] - float(sell["price"]),
+                        "bybit_buy_price": float(buy["price"]),
+                        "bybit_buy_size": float(buy["size"]),
+                        "bybit_sell_price": float(sell["price"]),
+                        "bybit_sell_size": float(sell["size"]),
+                        "bitbank_buy_price": float(bitbank_buy_order[0]["price"]),
+                        "bitbank_buy_size": float(bitbank_buy_order[0]["size"]),
+                        "bitbank_sell_price": float(bitbank_sell_order[0]["price"]),
+                        "bitbank_sell_size": float(bitbank_sell_order[0]["size"]),
+                        "usdypy": self.usdjpy["Close"],
+                        }
+            old_data = {}
+
+            today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            if os.path.exists(f"./data/{today}.json"):
+                with open(f"./data/{today}.json", "r") as f:
+                    old_data = json.load(f)
+                old_data[now_data["timestamp"]] = now_data
+            with open(f"./data/{today}.json", "w") as f:
+                json.dump(old_data, f, indent=2)
+
+
+
+
+            return False
+
+
+        except Exception as e:
+            self.logger.exception(e)
+            #print(traceback.format_exc().strip())
+
+
+# --------------------------------------- #
+# main
+# --------------------------------------- #
+if __name__ == '__main__':
+    import argparse
+    import auth
+
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    #pd.set_option('display.max_colwidth', -1)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prod", action='store_true')
+    args = parser.parse_args()
+
+    keys = {}
+    if args.prod:
+        bybit_key, bybit_secret = auth.BybitKeys().keys(prod=args.prod, env_name="lgbm")
+        bitbank_key, bitbank_secret = auth.BitbankKeys().keys()
+        gmocoin_key, gmocoin_secret = auth.GMOCoinKeys().keys()
+        keys = {'bybit': [bybit_key, bybit_secret],
+                'bitbank': [bitbank_key, bitbank_secret],
+                'gmocoin': [gmocoin_key, gmocoin_secret],}
+    else:
+        bybit_key, bybit_secret = auth.BybitKeys().keys(False, env_name="lgbm")
+        bitbank_key, bitbank_secret = auth.BitbankKeys().keys()
+        gmocoin_key, gmocoin_secret = auth.GMOCoinKeys().keys()
+        keys = {'bybit_testnet': [bybit_key, bybit_secret],
+                'bitbank': [bitbank_key, bitbank_secret],
+                'gmocoin': [gmocoin_key, gmocoin_secret], }
+    ArbitrageBot(keys=keys, prod=args.prod, log_level="INFO")
