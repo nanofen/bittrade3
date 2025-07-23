@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import json
 import traceback
@@ -47,7 +48,9 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         self.MAX_DATA_CAPACITY = 10
         self.sum_profit = 0
         self.sum_fee = 0
-        self.base_qty = 0.1
+        self.base_qty = 0.01
+        self.test_mode = False
+        self.test_start_time = time.time()
         self.bitbank_info = 0
 
 
@@ -100,7 +103,7 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             else:
                 self.orders_gmo = []
         except Exception as e:
-            print(traceback.format_exc().strip())
+            self.logger.error(traceback.format_exc().strip())
 
     async def order_list_bitbank(self):
         try:
@@ -182,8 +185,20 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
 
     async def run(self):
         checkout = False
+        print("Starting bot run...")
         self.bitbank_info = await self.bitbank.get_info_bitbank()
+        print(f"Bitbank info: {self.bitbank_info}")
+        
+        loop_count = 0
         while True:
+            loop_count += 1
+            print(f"\n=== Loop {loop_count} ===")
+            
+            # Test mode: stop after 5 seconds
+            if self.test_mode and (time.time() - self.test_start_time) > 5:
+                print("Test mode: 5 seconds elapsed, stopping...")
+                break
+            
             await self.order_check()
             await self.order_cancel_all()
             await self.position_check_bitbank()
@@ -199,8 +214,9 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
 
             # GMOの板情報を取得
             gmo_orderbooks = self.gmo.store.orderbooks.find({'symbol': self.gmo.SYMBOL})
+            print(f"GMO orderbooks: {len(gmo_orderbooks)}")
             if len(gmo_orderbooks) < 1:
-                self.logger.debug(f"**restart**. GMO orderbook data not available")
+                print("GMO orderbook data not available")
                 return True
             
             gmo_orderbook = gmo_orderbooks[0]
@@ -227,8 +243,10 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             res = await self.gmo.send()
 
             bitbank_orderbooks = self.bitbank.store.depth.find()
+            print(f"Bitbank orderbooks: {len(bitbank_orderbooks)}")
             bitbank_buy_order = [x for x in bitbank_orderbooks if x["side"] == "buy"]
             bitbank_sell_order = [x for x in bitbank_orderbooks if x["side"] == "sell"]
+            print(f"Bitbank buy orders: {len(bitbank_buy_order)}, sell orders: {len(bitbank_sell_order)}")
             #print(bitbank_buy_order) # 0が一番上
             #print(bitbank_sell_order) # 0が一番下
             # アービトラージ機会の計算（同一通貨JPYなので為替変換不要）
