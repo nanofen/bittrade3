@@ -66,7 +66,7 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
         self.qty = self.base_qty
         self.Debug = False
         self.positions_bitbank = {}
-        self.positions_bybit = {}
+        self.positions_bybit = {"sell_size": 0.0, "buy_size": 0.0}
         self.orders_bybit = []
         self.slip_in = 0.0
         self.slip_out = 0.0
@@ -167,15 +167,27 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
         dt = datetime.datetime.now(datetime.timezone.utc)
         utc_time = dt.replace(tzinfo=datetime.timezone.utc)
         ts_now = int(utc_time.timestamp())
+        
+        # 売りポジション（ショート）を取得
         sell_pos = self.bybit.store.position.find({'symbol': self.bybit.SYMBOL, 'side': 'Sell'})
         sell_pos_size = sum([float(x["size"]) for x in sell_pos])
+        
+        # 買いポジション（ロング）を取得
+        buy_pos = self.bybit.store.position.find({'symbol': self.bybit.SYMBOL, 'side': 'Buy'})
+        buy_pos_size = sum([float(x["size"]) for x in buy_pos])
+        
         if len(self.positions_bybit) == 0:
             self.positions_bybit = {"symbol": self.bybit.SYMBOL,
-                                    "size": 0,
+                                    "sell_size": 0.0,
+                                    "buy_size": 0.0,
                                     "timestamp": ts_now}
-        if sell_pos_size != self.positions_bybit["size"]:
+        
+        # 売りまたは買いポジションに変更があった場合に更新
+        if (sell_pos_size != self.positions_bybit.get("sell_size", 0) or 
+            buy_pos_size != self.positions_bybit.get("buy_size", 0)):
             self.positions_bybit = {"symbol": self.bybit.SYMBOL,
-                                    "size": sell_pos_size,
+                                    "sell_size": sell_pos_size,
+                                    "buy_size": buy_pos_size,
                                     "timestamp": ts_now}
 
     def get_timestamp(self):
@@ -280,13 +292,15 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
             # orderが残っている場合はキャンセル
             # return True
             # bitbankが安いのか / bybitが高いのか？は判定できてない
-            if self.positions_bitbank["size"] == 0 and self.positions_bybit["size"] == 0:
+            # Bybitの総ポジション（売り+買い）を計算
+            total_bybit_pos = self.positions_bybit.get("sell_size", 0) + self.positions_bybit.get("buy_size", 0)
+            if self.positions_bitbank["size"] == 0 and total_bybit_pos == 0:
                 self.offensive_mode = True
             # 最後にpositionを持ってから10分以上になったら利確モードに入る
             if self.positions_bitbank["timestamp"] + 60 * 10 < ts_now:
                 self.offensive_mode = False
             # 条件1 初期 まだ買えるがposが安定
-            if self.offensive_mode and self.positions_bitbank["size"] < self.base_qty and (self.positions_bybit["size"] == self.positions_bitbank["size"]):
+            if self.offensive_mode and self.positions_bitbank["size"] < self.base_qty and (self.positions_bybit.get("sell_size", 0) == self.positions_bitbank["size"]):
 
 
 
@@ -326,7 +340,7 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
                     ts_now = self.get_timestamp()
                     while True:
                         self.position_check_bybit()
-                        sell_pos_size = self.positions_bybit["size"]
+                        sell_pos_size = self.positions_bybit.get("sell_size", 0)
                         if sell_pos_size == 0:
                             pass
                         if sell_pos_size < pos_size:
@@ -340,13 +354,13 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
                     return False
                     #"""
             # 条件2 bitbankはいっぱいだがposが不安定
-            if self.offensive_mode and self.positions_bitbank["size"] == self.base_qty and (self.positions_bybit["size"] < self.positions_bitbank["size"]):
-                pos_size = self.positions_bitbank["size"] - self.positions_bybit["size"]
+            if self.offensive_mode and self.positions_bitbank["size"] == self.base_qty and (self.positions_bybit.get("sell_size", 0) < self.positions_bitbank["size"]):
+                pos_size = self.positions_bitbank["size"] - self.positions_bybit.get("sell_size", 0)
                 await self.bybit.sell_in(float(buy["price"]), pos_size)
                 ts_now = self.get_timestamp()
                 while True:
                     self.position_check_bybit()
-                    sell_pos_size = self.positions_bybit["size"]
+                    sell_pos_size = self.positions_bybit.get("sell_size", 0)
                     if sell_pos_size == 0:
                         pass
                     if sell_pos_size < pos_size:
@@ -359,7 +373,7 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
                     await asyncio.sleep(0.1)
                 return False
             # 条件2 bitbank bybitともにいっぱい
-            if not self.offensive_mode and (self.positions_bybit["size"] > 0 or self.positions_bitbank["size"] > 0):
+            if not self.offensive_mode and (total_bybit_pos > 0 or self.positions_bitbank["size"] > 0):
                 # 売る
                 if float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"] - float(sell["price"]) > 0:
                     await self.bitbank.buy_out(float(bitbank_sell_order[0]["price"]), self.positions_bitbank["size"])
@@ -385,7 +399,13 @@ class ArbitrageBot(bybitbot_base.BybitBotBase):
                           bitbank_buy_order[0]["size"], float(bitbank_buy_order[0]["price"]) / self.usdjpy["Close"],
                           sell["size"], sell["price"], )
 
-                    await self.bybit.buy_out(float(sell["price"]), self.positions_bybit["size"] - pos_size)
+                    # 売りポジションがある場合は売りポジションを決済
+                    if self.positions_bybit.get("sell_size", 0) > 0:
+                        await self.bybit.sell_out(float(sell["price"]), self.positions_bybit["sell_size"] - pos_size)
+                    
+                    # 買いポジションがある場合は買いポジションを決済
+                    if self.positions_bybit.get("buy_size", 0) > 0:
+                        await self.bybit.buy_out(float(sell["price"]), self.positions_bybit["buy_size"])
 
             now_data = {"timestamp": ts_now,
                         "in_diff": float(buy["price"]) - float(bitbank_sell_order[0]["price"]) / self.usdjpy["Close"],
