@@ -389,14 +389,18 @@ class Socket_PyBotters_GMOCoin():
 
     async def ws_run(self):
         try:
+            print(f"GMO WebSocket starting with keys: {list(self.KEYS.keys())}")
             async with pybotters.Client(apis=self.KEYS, base_url=self.URLS["REST_PRIVATE"]) as client:
+                print("GMO Client created, initializing store...")
                 await self.store.initialize(
                     client.post("/v1/ws-auth", params={}),
                     client.get("/v1/activeOrders", params={'symbol': self.SYMBOL}),
                     client.get("/v1/openPositions", params={'symbol': self.SYMBOL}),
                     client.get("/v1/latestExecutions", params={'symbol': self.SYMBOL}),
                     client.get("/v1/positionSummary", params={}),)
+                print("GMO Store initialized successfully")
 
+                print("Connecting to GMO public WebSocket...")
                 await client.ws_connect(
                     self.URLS['WebSocket_Public'],
                     send_json=[{
@@ -412,7 +416,9 @@ class Socket_PyBotters_GMOCoin():
                     ],
                     hdlr_json=self.store.onmessage
                 )
+                print("GMO public WebSocket connected")
 
+                print(f"Connecting to GMO private WebSocket with token: {self.store.token[:10]}...")
                 await client.ws_connect(
                     self.URLS['WebSocket_Private'].format(self.store.token),
                     send_json=[
@@ -427,6 +433,7 @@ class Socket_PyBotters_GMOCoin():
                     ],
                     hdlr_json=self.store.onmessage,
                 )
+                print("GMO private WebSocket connected")
 
 
 
@@ -444,7 +451,9 @@ class Socket_PyBotters_GMOCoin():
                 #)
                 #await watch_kline
         except Exception as e:
-            print(e)
+            print(f"GMO WebSocket error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 

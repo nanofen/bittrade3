@@ -21,14 +21,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Main Entry Point:**
 ```bash
-python main.py [--prod]
+python3 main.py [--prod]
 ```
 - Default: runs in testnet mode using test API keys
 - `--prod`: runs in production mode with real API keys
 
 **Test Script:**
 ```bash
-python test.py
+python3 test.py
 ```
 
 ## Code Architecture

@@ -98,8 +98,75 @@ class Socket_PyBotters_BitBank():
         response = await self.send()
         print(response)
 
+    # 信用取引用メソッド
+    async def margin_buy_in(self, price, qty):
+        """
+        信用取引での買い建て（ロング）
+        """
+        self.order_create(side="buy",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="long"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_sell_in(self, price, qty):
+        """
+        信用取引での売り建て（ショート）
+        """
+        self.order_create(side="sell",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="short"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_buy_out(self, price, qty):
+        """
+        信用取引での買い決済（ショートポジションの決済）
+        """
+        self.order_create(side="buy",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="short"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
+    async def margin_sell_out(self, price, qty):
+        """
+        信用取引での売り決済（ロングポジションの決済）
+        """
+        self.order_create(side="sell",
+                          pair=self.SYMBOL,
+                          order_type="limit",
+                          qty=qty,
+                          price=price,
+                          position_side="long"
+                          )
+        response = await self.send()
+        print(response)
+        return response
+
     async def order_cancel(self, order_id):
         self._order_cancel(order_id=order_id, pair=self.SYMBOL)
+        response = await self.send()
+        print(response)
+
+    async def margin_order_cancel(self, order_id):
+        """信用取引用の注文キャンセル"""
+        self._margin_order_cancel(order_id=order_id, pair=self.SYMBOL)
         response = await self.send()
         print(response)
 
@@ -205,8 +272,10 @@ class Socket_PyBotters_BitBank():
     # REST API(Account Data Endpoints)
     # ------------------------------------------------ #
 
-    def order_create(self, side, pair, order_type, qty, price='', post_only='', trigger_price=''):
+    def order_create(self, side, pair, order_type, qty, price='', post_only='', trigger_price='', position_side=''):
+        # Bitbankでは信用取引も現物取引も同じエンドポイントを使用
         target_path = '/user/spot/order'
+            
         params = {
                     'side': side,
                     'pair': pair,
@@ -220,13 +289,39 @@ class Socket_PyBotters_BitBank():
             params['post_only'] = post_only
         if len(str(trigger_price)) > 0:
             params['trigger_price'] = trigger_price
+        # 信用取引の場合はposition_sideパラメータを追加
+        if position_side in ['long', 'short']:
+            params['position_side'] = position_side
 
         self.set_request(method='POST', access_modifiers='private',
                          target_path=target_path, params=params)
         print(self.requests)
     
-    # Get Active Order
+    # Get Active Order（現物取引）
     def order_list(self, pair, count=None, from_id=None, end_id=None, since=None, end=None):
+        target_path = '/user/spot/active_orders'
+        
+        params = {
+                    'pair': pair
+        }
+
+        if count is not None:
+            params['count'] = int(count)
+        if from_id is not None:
+            params['from_id'] = int(from_id)
+        if end_id is not None:
+            params['end_id'] = int(end_id)
+        if since is not None:
+            params['since'] = int(since)
+        if end is not None:
+            params['end'] = int(end)
+
+        self.set_request(method='GET', access_modifiers='private',
+                         target_path=target_path, params=params)
+    
+    # Get Active Order（信用取引用）
+    def margin_order_list(self, pair, count=None, from_id=None, end_id=None, since=None, end=None):
+        # 信用取引の注文リストも現物と同じエンドポイントを使用
         target_path = '/user/spot/active_orders'
         
         params = {
@@ -249,7 +344,7 @@ class Socket_PyBotters_BitBank():
 
 
 
-    # Cancel Active Order
+    # Cancel Active Order（現物取引）
     # 未確認
     # ================================================================
     # Request Parameters
@@ -258,6 +353,19 @@ class Socket_PyBotters_BitBank():
     # order_id	        true	    string	    Order ID. Required if not passing order_link_id
     # ================================================================
     def _order_cancel(self, pair, order_id=''):
+        target_path = '/user/spot/cancel_order'
+        
+        params = {
+                    'pair': pair,
+                    'order_id': order_id,
+        }
+
+        self.set_request(method='POST', access_modifiers='private',
+                         target_path=target_path, params=params)
+
+    # Cancel Active Order（信用取引）
+    def _margin_order_cancel(self, pair, order_id=''):
+        # 注文キャンセルも現物と同じエンドポイントを使用
         target_path = '/user/spot/cancel_order'
         
         params = {
@@ -292,7 +400,7 @@ class Socket_PyBotters_BitBank():
                          target_path=target_path, params=params)
 
 
-    # My Position
+    # My Position（現物取引用）
     # 確認済
     # ================================================================
     # Request Parameters
@@ -301,6 +409,14 @@ class Socket_PyBotters_BitBank():
     # ================================================================
     def position_list(self):
         target_path = '/user/assets'
+
+        self.set_request(method='GET', access_modifiers='private',
+                         target_path=target_path, params={})
+
+    # My Position（信用取引用）
+    def margin_position_list(self):
+        # 信用取引専用のポジション確認エンドポイント
+        target_path = '/user/margin/positions'
 
         self.set_request(method='GET', access_modifiers='private',
                          target_path=target_path, params={})
@@ -351,40 +467,31 @@ class Socket_PyBotters_BitBank():
     # ------------------------------------------------ #
 
     async def ws_run(self):
-        async with pybotters.Client(apis=self.KEYS) as client:
+        try:
+            print(f"Bitbank WebSocket starting with keys: {list(self.KEYS.keys())}")
+            async with pybotters.Client(apis=self.KEYS) as client:
+                print("Connecting to Bitbank WebSocket...")
+                
+                # WebSocket接続の開始
+                await client.ws_connect(
+                    self.URLS['WebSocket_Public'],
+                    send_str=[
+                        f'42["join-room","ticker_{self.SYMBOL}"]',
+                        f'42["join-room","transactions_{self.SYMBOL}"]',
+                        f'42["join-room","depth_whole_{self.SYMBOL}"]',
+                    ],
+                    hdlr_str=self.store.onmessage,
+                )
+                print("Bitbank WebSocket connected")
 
-            public = await client.ws_connect(
-                self.URLS['WebSocket_Public'],
-                send_str=[
-                    f'42["join-room","ticker_{self.SYMBOL}"]',
-                    f'42["join-room","transactions_{self.SYMBOL}"]',
-                    f'42["join-room","depth_whole_{self.SYMBOL}"]',
-                ],
-                hdlr_str=self.store.onmessage,
-            )
+                # データ受信の監視ループ
+                while True:
+                    await self.store.wait()
 
-            #def stores(store):
-            #    xx = []
-            #    for x in self.PUBLIC_CHANNELS:
-            #        if x.startswith('candle.'):
-            #            xx.append(len(store.kline))
-            #        if x.startswith('trade.'):
-            #            xx.append(len(store.trade))
-            #        if x.startswith('orderBookL2_25.') or x.startswith('orderBook_200.'):
-            #            xx.append(len(store.orderbook))
-            #        if x.startswith('instrument_info.'):
-            #            xx.append(len(store.instrument))
-            #    return xx
-            #while not all(stores(self.store)):
-            while True:
-                await self.store.wait()
-                # store dict
-                # {'orderbook', 'trade', 'insurance', 'instrument', 'kline', 'liquidation', 'position_inverse', 'position_usdt', 'execution', 'order', 'stoporder', 'wallet', '_events', 'timestamp_e6'}
-
-            #watch_kline = await asyncio.gather(
-            #    self.realtime_klines(),
-            #)
-            #await watch_kline
+        except Exception as e:
+            print(f"Bitbank WebSocket error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def realtime_klines(self):
         with self.store.kline.watch() as klines:
