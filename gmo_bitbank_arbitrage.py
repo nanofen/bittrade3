@@ -28,7 +28,8 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         super().__init__()
         self.keys = keys
 
-        print(self.keys)
+        if self.Debug:
+            self.logger.debug(f"API keys loaded: {list(self.keys.keys())}")
 
         self.gmo = Socket_PyBotters_GMOCoin(self.keys)
         self.gmo.SYMBOL = 'BTC_JPY'
@@ -52,6 +53,15 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         self.test_mode = False
         self.test_start_time = time.time()
         self.bitbank_info = 0
+        
+        # 【分析結果ベース最適化パラメータ】
+        # realistic_arbitrage_analysis結果: SL-10k(+573,049円, 83.9%勝率)が最適
+        self.entry_threshold = 40000      # エントリー閾値（分析結果: 40k円で最適収益）
+        self.exit_threshold = 10000       # 利益確定閾値（分析結果: 10k円で最高収益）
+        self.stop_loss_threshold = -10000 # 損切り閾値（分析結果: -10k円で83.9%勝率）
+        self.trading_fee = 0.001          # 手数料 0.1%
+        self.max_hold_minutes = 240       # 最大保有時間（分析結果: 240分で98.2%成功率）
+        self.prefer_gmo_to_bitbank = True # GMO→Bitbank方向を優先
 
 
         self.qty = self.base_qty
@@ -65,6 +75,9 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         self.orders_bitbank = []
         self.btc_amounts = {}
         self.offensive_mode = True
+        self.position_entry_time = None  # ポジション建玉時刻を記録
+        self.entry_arbitrage_1 = 0  # エントリー時のarbitrage_1を記録
+        self.entry_arbitrage_2 = 0  # エントリー時のarbitrage_2を記録
 
 
         self.logger = get_custom_logger(log_level)
@@ -72,23 +85,46 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         self.emergency_qty_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
 
-        # タスクの設定およびイベントループの開始
-        loop = asyncio.get_event_loop()
-        tasks = [
-            self.gmo.ws_run(),
-            self.bitbank.ws_run(),
-            self.run()
-        ]
+        # 【修正】タスクの設定およびイベントループの改善
+        self.start_bot()
 
-        loop.run_until_complete(asyncio.wait(tasks))
+    def start_bot(self):
+        """ボットを開始する"""
+        try:
+            asyncio.run(self.run_all_tasks())
+        except KeyboardInterrupt:
+            print("ボット停止中...")
+        except Exception as e:
+            print(f"ボット実行エラー: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def run_all_tasks(self):
+        """すべてのタスクを実行する"""
+        print("すべてのタスクを開始...")
+        tasks = [
+            asyncio.create_task(self.gmo.ws_run(), name="gmo_websocket"),
+            asyncio.create_task(self.bitbank.ws_run(), name="bitbank_websocket"),
+            asyncio.create_task(self.run(), name="main_logic")
+        ]
+        
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"タスク実行エラー: {e}")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
 
     async def order_check(self):
         await self.order_list_bitbank()
         await self.order_list_gmo()
 
     async def order_cancel_all(self):
+        # 【修正】Bitbankは信用取引用の注文キャンセルを使用
         for order in self.orders_bitbank:
-            await self.bitbank.order_cancel(order_id=order["order_id"])
+            await self.bitbank.margin_order_cancel(order_id=order["order_id"])
         for order in self.orders_gmo:
             await self.gmo.order_cancel(order_id=order["orderId"])
         res = await self.bitbank.send()
@@ -107,42 +143,73 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
 
     async def order_list_bitbank(self):
         try:
-            self.bitbank.order_list(self.bitbank.SYMBOL)
+            # 【修正】信用取引用の注文リスト取得
+            self.bitbank.margin_order_list(self.bitbank.SYMBOL)
             res = await self.bitbank.send()
-            if res[0]["data"]["orders"] is not None:
-                self.orders_bitbank = res[0]["data"]["orders"]
+            # print(f"Bitbank order list response: {res}")
+            # レスポンスが空リストの場合は正常（注文なし）
+            if isinstance(res, list) and len(res) == 0:
+                self.orders_bitbank = []
+            elif res and len(res) > 0 and "data" in res[0]:
+                if "orders" in res[0]["data"] and res[0]["data"]["orders"] is not None:
+                    self.orders_bitbank = res[0]["data"]["orders"]
+                else:
+                    self.orders_bitbank = []
             else:
                 self.orders_bitbank = []
         except Exception as e:
-            print(traceback.format_exc().strip())
+            print(f"Bitbank order list error: {e}")
+            self.orders_bitbank = []
 
     async def position_check_bitbank(self):
-        self.bitbank.position_list()
-        dt = datetime.datetime.now(datetime.timezone.utc)
-        utc_time = dt.replace(tzinfo=datetime.timezone.utc)
-        ts_now = int(utc_time.timestamp())
-        res = await self.bitbank.send()
-        if res[0]["data"]["assets"] is not None:
-            btc_amount = 0.0
-            for x in res[0]["data"]["assets"]:
-                if x["asset"] == 'btc':
-                    btc_amount = float(x["onhand_amount"])
-                    break
-            if len(self.btc_amounts) == 0:
-                self.btc_amounts["base"] = btc_amount
-                self.btc_amounts[ts_now] = btc_amount
+        # 【修正】信用取引用のポジション確認に変更
+        try:
+            self.bitbank.margin_position_list()
+            dt = datetime.datetime.now(datetime.timezone.utc)
+            utc_time = dt.replace(tzinfo=datetime.timezone.utc)
+            ts_now = int(utc_time.timestamp())
+            res = await self.bitbank.send()
+            
+            # print(f"Bitbank position response: {res}")
+            
+            # 【修正】新しい信用取引ポジション情報の処理
+            if res and len(res) > 0 and "data" in res[0]:
+                positions_data = res[0]["data"]
+                long_size = 0.0
+                short_size = 0.0
+                
+                # 新しいレスポンス形式に対応
+                if "positions" in positions_data and positions_data["positions"] is not None:
+                    for pos in positions_data["positions"]:
+                        if pos["pair"] == self.bitbank.SYMBOL:
+                            if pos["position_side"] == "long":  # 修正: "side" -> "position_side"
+                                long_size += float(pos["open_amount"])  # 修正: "amount" -> "open_amount"
+                            elif pos["position_side"] == "short":  # 修正: "side" -> "position_side"
+                                short_size += float(pos["open_amount"])  # 修正: "amount" -> "open_amount"
+                
+                # ネットポジション計算（long - short）
+                net_size = long_size - short_size
+                
                 self.positions_bitbank = {"symbol": self.bitbank.SYMBOL,
-                                          "size": 0.0,
+                                          "size": net_size,
+                                          "long_size": long_size,
+                                          "short_size": short_size,
                                           "timestamp": ts_now}
             else:
-                size = btc_amount - self.btc_amounts["base"]
-                if size != self.positions_bitbank["size"]:
-                    if size < float(self.bitbank_info["unit_amount"]):
-                        size = 0
-                    self.btc_amounts[ts_now] = btc_amount
-                    self.positions_bitbank = {"symbol": self.bitbank.SYMBOL,
-                                              "size": size,
-                                              "timestamp": ts_now}
+                self.positions_bitbank = {"symbol": self.bitbank.SYMBOL,
+                                          "size": 0.0,
+                                          "long_size": 0.0,
+                                          "short_size": 0.0,
+                                          "timestamp": ts_now}
+        except Exception as e:
+            print(f"Bitbank position check error: {e}")
+            print(traceback.format_exc().strip())
+            # エラー時はデフォルト値を設定
+            self.positions_bitbank = {"symbol": self.bitbank.SYMBOL,
+                                      "size": 0.0,
+                                      "long_size": 0.0,
+                                      "short_size": 0.0,
+                                      "timestamp": int(datetime.datetime.now(datetime.timezone.utc).timestamp())}
 
     def position_check_gmo(self):
         dt = datetime.datetime.now(datetime.timezone.utc)
@@ -188,15 +255,11 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
         print("Starting bot run...")
         self.bitbank_info = await self.bitbank.get_info_bitbank()
         print(f"Bitbank info: {self.bitbank_info}")
-        
-        loop_count = 0
+
         while True:
-            loop_count += 1
-            print(f"\n=== Loop {loop_count} ===")
-            
-            # Test mode: stop after 5 seconds
-            if self.test_mode and (time.time() - self.test_start_time) > 5:
-                print("Test mode: 5 seconds elapsed, stopping...")
+            # Test mode: stop after 10 minutes for opportunity analysis
+            if self.test_mode and (time.time() - self.test_start_time) > 600:
+                print("Test mode: 10 minutes elapsed, stopping...")
                 break
             
             await self.order_check()
@@ -214,17 +277,20 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
 
             # GMOの板情報を取得
             gmo_orderbooks = self.gmo.store.orderbooks.find({'symbol': self.gmo.SYMBOL})
-            print(f"GMO orderbooks: {len(gmo_orderbooks)}")
+            # print(f"GMO orderbooks: {len(gmo_orderbooks)}")
+            
             if len(gmo_orderbooks) < 1:
                 print("GMO orderbook data not available")
                 return True
             
-            gmo_orderbook = gmo_orderbooks[0]
-            gmo_bids = gmo_orderbook.get('bids', [])
-            gmo_asks = gmo_orderbook.get('asks', [])
+            # GMOのorderbookからbids/asks抽出（データ構造に依存）
+            gmo_bids = [x for x in gmo_orderbooks if x.get('side') == 'bids']
+            gmo_asks = [x for x in gmo_orderbooks if x.get('side') == 'asks']
+            
+            # print(f"GMO bids: {len(gmo_bids)}, asks: {len(gmo_asks)}")
             
             if len(gmo_bids) < 1 or len(gmo_asks) < 1:
-                self.logger.debug(f"**restart**. GMO insufficient orderbook data")
+                print(f"GMO insufficient bid/ask data")
                 return True
                 
             gmo_best_bid = gmo_bids[0]  # 最高買い価格
@@ -235,18 +301,21 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             # print(self.bitbank.store.transactions.find())
             # 注文記録
 
+            # 【修正】Bitbankは信用取引用の注文キャンセルを使用
             for order in self.orders_bitbank:
-                await self.bitbank.order_cancel(order_id=order["order_id"])
+                await self.bitbank.margin_order_cancel(order_id=order["order_id"])
             for order in self.orders_gmo:
                 await self.gmo.order_cancel(order_id=order["orderId"])
             res = await self.bitbank.send()
             res = await self.gmo.send()
 
             bitbank_orderbooks = self.bitbank.store.depth.find()
-            print(f"Bitbank orderbooks: {len(bitbank_orderbooks)}")
-            bitbank_buy_order = [x for x in bitbank_orderbooks if x["side"] == "buy"]
-            bitbank_sell_order = [x for x in bitbank_orderbooks if x["side"] == "sell"]
-            print(f"Bitbank buy orders: {len(bitbank_buy_order)}, sell orders: {len(bitbank_sell_order)}")
+            # print(f"Bitbank orderbooks: {len(bitbank_orderbooks)}")
+            
+            # Bitbankは "bids"/"asks" を使用（単体テストで確認済み）
+            bitbank_buy_order = [x for x in bitbank_orderbooks if x["side"] == "bids"]
+            bitbank_sell_order = [x for x in bitbank_orderbooks if x["side"] == "asks"]
+            # print(f"Bitbank buy orders: {len(bitbank_buy_order)}, sell orders: {len(bitbank_sell_order)}")
             #print(bitbank_buy_order) # 0が一番上
             #print(bitbank_sell_order) # 0が一番下
             # アービトラージ機会の計算（同一通貨JPYなので為替変換不要）
@@ -259,25 +328,48 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             gmo_bid_price = float(gmo_best_bid['price']) if gmo_best_bid else 0
             bitbank_ask_price = float(bitbank_sell_order[0]["price"]) if bitbank_sell_order else 0
             
-            # 価格差計算
-            arbitrage_opportunity_1 = bitbank_bid_price - gmo_ask_price  # GMO買い、Bitbank売り
-            arbitrage_opportunity_2 = gmo_bid_price - bitbank_ask_price  # GMO売り、Bitbank買い
+            # 【修正】アービトラージ機会計算（realistic_arbitrage_analysis.pyと統一）
+            arbitrage_1 = bitbank_bid_price - gmo_ask_price  # GMO買い→Bitbank売り（パターン1）
+            arbitrage_2 = gmo_bid_price - bitbank_ask_price  # GMO売り→Bitbank買い（パターン2）
+            
+            # 価格差情報を常にログ出力（約定機会分析用）
+            self.logger.info(f"価格差分析 - arbitrage_1(GMO買い/BB売り): {arbitrage_1:.1f}円, arbitrage_2(GMO売り/BB買い): {arbitrage_2:.1f}円")
+            self.logger.info(f"価格詳細 - GMO買値:{gmo_ask_price}, GMO売値:{gmo_bid_price}, BB買値:{bitbank_bid_price}, BB売値:{bitbank_ask_price}")
+            
+            # 分析結果と統一した変数名
+            gmo_to_bitbank_profit = arbitrage_1  # GMO買い→Bitbank売り
+            bitbank_to_gmo_profit = arbitrage_2  # Bitbank買い→GMO売り
+            
+            # 方向性フィルター: GMO→Bitbank方向を優先（分析結果で高収益）
+            primary_opportunity = gmo_to_bitbank_profit if self.prefer_gmo_to_bitbank else max(gmo_to_bitbank_profit, bitbank_to_gmo_profit)
+            secondary_opportunity = bitbank_to_gmo_profit if self.prefer_gmo_to_bitbank else min(gmo_to_bitbank_profit, bitbank_to_gmo_profit)
+            
+            if primary_opportunity > self.entry_threshold:
+                direction = "GMO→Bitbank" if self.prefer_gmo_to_bitbank else "最適方向"
+                self.logger.warning(f"*** 約定機会検出 *** {direction}: {primary_opportunity:.1f}円の価格差（閾値{self.entry_threshold}円超過）")
+            
+            if secondary_opportunity > self.entry_threshold:
+                direction = "Bitbank→GMO" if self.prefer_gmo_to_bitbank else "サブ方向"
+                self.logger.info(f"サブ機会: {direction}が{self.entry_threshold}円閾値を超過 ({secondary_opportunity:.1f}円)")
             # ポジション状態の確認
             bitbank_position_size = self.positions_bitbank.get("size", 0)
             gmo_long_size = self.positions_gmo.get("long_size", 0)
             gmo_short_size = self.positions_gmo.get("short_size", 0)
             total_gmo_pos = gmo_long_size + gmo_short_size
             
-            # モード判定
+            # 【修正】モード判定（分析結果ベース: 240分保有）
             if bitbank_position_size == 0 and total_gmo_pos == 0:
                 self.offensive_mode = True
-            # 最後にpositionを持ってから10分以上になったら利確モードに入る
-            elif self.positions_bitbank.get("timestamp", 0) + 60 * 10 < ts_now:
+                self.position_entry_time = None
+                self.entry_arbitrage_1 = 0
+                self.entry_arbitrage_2 = 0
+            # 分析結果ベース: 240分経過または実P&Lベースの判定
+            elif self.positions_bitbank.get("timestamp", 0) + 60 * self.max_hold_minutes < ts_now:
                 self.offensive_mode = False
-            # 新規アービトラージ実行（攻撃モード）
+            # 分析ベースの最適化された新規アービトラージ実行
             if self.offensive_mode and bitbank_position_size < self.base_qty and total_gmo_pos <= bitbank_position_size:
-                # アービトラージ機会1: GMO買い、Bitbank信用売り
-                if arbitrage_opportunity_1 > 500:  # 500円以上の価格差
+                # 優先機会: GMO買い→Bitbank信用売り（分析結果で高収益）
+                if True and gmo_to_bitbank_profit > self.entry_threshold:  # 実取引有効化
                     qty = min(float(bitbank_buy_order[0]["size"]), self.base_qty - bitbank_position_size)
                     
                     # GMOで買いポジション
@@ -286,11 +378,15 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                     # Bitbank信用取引でショート
                     await self.bitbank.margin_sell_in(bitbank_bid_price, qty)
                     
-                    print(f"アービトラージ実行: GMO買い@{gmo_ask_price}, Bitbank売り@{bitbank_bid_price}, 差額:{arbitrage_opportunity_1}円, 数量:{qty}")
+                    # ポジション建玉時刻とエントリー価格差を記録
+                    self.position_entry_time = ts_now
+                    self.entry_arbitrage_1 = arbitrage_1
+                    
+                    print(f"アービトラージ実行: GMO買い@{gmo_ask_price}, Bitbank売り@{bitbank_bid_price}, 差額:{arbitrage_1}円, 数量:{qty}")
                     return False
                     
-                # アービトラージ機会2: GMO売り、Bitbank信用買い  
-                elif arbitrage_opportunity_2 > 500:  # 500円以上の価格差
+                # サブ機会: Bitbank買い→GMO信用売り（低収益だが機会あり）
+                elif True and bitbank_to_gmo_profit > self.entry_threshold and gmo_to_bitbank_profit <= self.entry_threshold:  # メイン機会がない場合のみ
                     qty = min(float(bitbank_sell_order[0]["size"]), self.base_qty - bitbank_position_size)
                     
                     # GMOで売りポジション
@@ -299,7 +395,11 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                     # Bitbank信用取引でロング
                     await self.bitbank.margin_buy_in(bitbank_ask_price, qty)
                     
-                    print(f"アービトラージ実行: GMO売り@{gmo_bid_price}, Bitbank買い@{bitbank_ask_price}, 差額:{arbitrage_opportunity_2}円, 数量:{qty}")
+                    # ポジション建玉時刻とエントリー価格差を記録
+                    self.position_entry_time = ts_now
+                    self.entry_arbitrage_2 = arbitrage_2
+                    
+                    print(f"アービトラージ実行: GMO売り@{gmo_bid_price}, Bitbank買い@{bitbank_ask_price}, 差額:{arbitrage_2}円, 数量:{qty}")
                     return False
             # ポジション調整（GMOとBitbankのポジション不均衡解消）
             if self.offensive_mode and bitbank_position_size == self.base_qty and total_gmo_pos < bitbank_position_size:
@@ -313,11 +413,23 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                 
             # 利確モード（ポジション決済） 
             if not self.offensive_mode and (total_gmo_pos > 0 or bitbank_position_size != 0):
-                # 利確可能性をチェック
-                profit_opportunity_1 = gmo_bid_price - bitbank_ask_price  # GMOロング、Bitbankショート決済
-                profit_opportunity_2 = bitbank_bid_price - gmo_ask_price  # GMOショート、Bitbankロング決済
+                # 【修正】正しいnet_profit計算：実際のエントリー時の利益＋決済時の利益
+                # パターン1: GMOロング + Bitbankショート → GMO売り + Bitbank買い戻し
+                entry_profit_1 = self.entry_arbitrage_1  # 実際のエントリー時の利益
+                exit_profit_1 = gmo_bid_price - bitbank_ask_price  # 決済時の利益
+                gross_profit_1 = entry_profit_1 + exit_profit_1
+                trading_fee_1 = (abs(entry_profit_1) + abs(exit_profit_1)) * self.trading_fee
+                net_profit_1 = gross_profit_1 - trading_fee_1
                 
-                if profit_opportunity_1 > 0 and gmo_long_size > 0:  # GMOロング + Bitbankショート決済
+                # パターン2: GMOショート + Bitbankロング → GMO買い戻し + Bitbank売り
+                entry_profit_2 = self.entry_arbitrage_2  # 実際のエントリー時の利益
+                exit_profit_2 = bitbank_bid_price - gmo_ask_price  # 決済時の利益
+                gross_profit_2 = entry_profit_2 + exit_profit_2
+                trading_fee_2 = (abs(entry_profit_2) + abs(exit_profit_2)) * self.trading_fee
+                net_profit_2 = gross_profit_2 - trading_fee_2
+                
+                # 分析ベース最適化エグジット条件
+                if (net_profit_1 > self.exit_threshold or net_profit_1 < self.stop_loss_threshold) and gmo_long_size > 0:  # GMOロング + Bitbankショート決済
                     close_qty = min(gmo_long_size, abs(bitbank_position_size))
                     
                     # GMOロングポジション決済（売り）
@@ -328,10 +440,11 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                     # Bitbankショートポジション決済（買い）
                     await self.bitbank.margin_buy_out(bitbank_ask_price, close_qty)
                     
-                    print(f"利確決済: GMOロング決済@{gmo_bid_price}, Bitbankショート決済@{bitbank_ask_price}, 利益:{profit_opportunity_1}円, 数量:{close_qty}")
+                    exit_reason = "利確" if net_profit_1 > self.exit_threshold else "損切り"
+                    print(f"{exit_reason}決済: GMOロング決済@{gmo_bid_price}, Bitbankショート決済@{bitbank_ask_price}, 純利益:{net_profit_1:.2f}円, 数量:{close_qty}")
                     return False
                     
-                elif profit_opportunity_2 > 0 and gmo_short_size > 0:  # GMOショート + Bitbankロング決済
+                elif (net_profit_2 > self.exit_threshold or net_profit_2 < self.stop_loss_threshold) and gmo_short_size > 0:  # GMOショート + Bitbankロング決済
                     close_qty = min(gmo_short_size, bitbank_position_size)
                     
                     # GMOショートポジション決済（買い）
@@ -342,20 +455,24 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                     # Bitbankロングポジション決済（売り）
                     await self.bitbank.margin_sell_out(bitbank_bid_price, close_qty)
                     
-                    print(f"利確決済: GMOショート決済@{gmo_ask_price}, Bitbankロング決済@{bitbank_bid_price}, 利益:{profit_opportunity_2}円, 数量:{close_qty}")
+                    exit_reason = "利確" if net_profit_2 > self.exit_threshold else "損切り"
+                    print(f"{exit_reason}決済: GMOショート決済@{gmo_ask_price}, Bitbankロング決済@{bitbank_bid_price}, 純利益:{net_profit_2:.2f}円, 数量:{close_qty}")
                     return False
 
+            # 【修正】データ保存フォーマット（分析スクリプトと統一）
             now_data = {"timestamp": ts_now,
-                        "arbitrage_opportunity_1": arbitrage_opportunity_1,
-                        "arbitrage_opportunity_2": arbitrage_opportunity_2,
-                        "gmo_bid_price": gmo_bid_price,
-                        "gmo_ask_price": gmo_ask_price,
-                        "bitbank_bid_price": bitbank_bid_price,
-                        "bitbank_ask_price": bitbank_ask_price,
+                        "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "arbitrage_1": arbitrage_1,
+                        "arbitrage_2": arbitrage_2,
+                        "gmo_bid": gmo_bid_price,
+                        "gmo_ask": gmo_ask_price,
+                        "bitbank_bid": bitbank_bid_price,
+                        "bitbank_ask": bitbank_ask_price,
                         "bitbank_position_size": bitbank_position_size,
                         "gmo_long_size": gmo_long_size,
                         "gmo_short_size": gmo_short_size,
                         "offensive_mode": self.offensive_mode,
+                        "max_arbitrage": max(arbitrage_1, arbitrage_2),
                         }
             old_data = {}
 
