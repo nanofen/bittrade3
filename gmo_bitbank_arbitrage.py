@@ -315,26 +315,45 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             # Bitbankは "bids"/"asks" を使用（単体テストで確認済み）
             bitbank_buy_order = [x for x in bitbank_orderbooks if x["side"] == "bids"]
             bitbank_sell_order = [x for x in bitbank_orderbooks if x["side"] == "asks"]
-            # print(f"Bitbank buy orders: {len(bitbank_buy_order)}, sell orders: {len(bitbank_sell_order)}")
-            #print(bitbank_buy_order) # 0が一番上
-            #print(bitbank_sell_order) # 0が一番下
+            
+            # 板情報の存在確認
+            if not bitbank_buy_order or not bitbank_sell_order:
+                self.logger.warning(f"Bitbank板情報不足 - buy orders: {len(bitbank_buy_order)}, sell orders: {len(bitbank_sell_order)}")
+                return True
             # アービトラージ機会の計算（同一通貨JPYなので為替変換不要）
             # パターン1: GMOで買い、Bitbank信用でショート
             # 条件: GMOの売値 < Bitbankの買値
             gmo_ask_price = float(gmo_best_ask['price']) if gmo_best_ask else 0
-            bitbank_bid_price = float(bitbank_buy_order[0]["price"]) if bitbank_buy_order else 0
+            # Bitbank板情報の構造確認：[price, amount]配列かオブジェクトか
+            if bitbank_buy_order:
+                if isinstance(bitbank_buy_order[0], list):
+                    # API仕様通りの[price, amount]配列形式
+                    bitbank_bid_price = float(bitbank_buy_order[0][0])  # price
+                else:
+                    # pybottersが変換したオブジェクト形式
+                    bitbank_bid_price = float(bitbank_buy_order[0]["price"])
+            else:
+                bitbank_bid_price = 0
             
             # パターン2: GMOで売り、Bitbank信用でロング  
             gmo_bid_price = float(gmo_best_bid['price']) if gmo_best_bid else 0
-            bitbank_ask_price = float(bitbank_sell_order[0]["price"]) if bitbank_sell_order else 0
+            if bitbank_sell_order:
+                if isinstance(bitbank_sell_order[0], list):
+                    # API仕様通りの[price, amount]配列形式
+                    bitbank_ask_price = float(bitbank_sell_order[0][0])  # price
+                else:
+                    # pybottersが変換したオブジェクト形式
+                    bitbank_ask_price = float(bitbank_sell_order[0]["price"])
+            else:
+                bitbank_ask_price = 0
             
             # 【修正】アービトラージ機会計算（realistic_arbitrage_analysis.pyと統一）
             arbitrage_1 = bitbank_bid_price - gmo_ask_price  # GMO買い→Bitbank売り（パターン1）
             arbitrage_2 = gmo_bid_price - bitbank_ask_price  # GMO売り→Bitbank買い（パターン2）
             
             # 価格差情報を常にログ出力（約定機会分析用）
-            self.logger.info(f"価格差分析 - arbitrage_1(GMO買い/BB売り): {arbitrage_1:.1f}円, arbitrage_2(GMO売り/BB買い): {arbitrage_2:.1f}円")
-            self.logger.info(f"価格詳細 - GMO買値:{gmo_ask_price}, GMO売値:{gmo_bid_price}, BB買値:{bitbank_bid_price}, BB売値:{bitbank_ask_price}")
+            self.logger.debug(f"価格差分析 - arbitrage_1(GMO買い/BB売り): {arbitrage_1:.1f}円, arbitrage_2(GMO売り/BB買い): {arbitrage_2:.1f}円")
+            self.logger.debug(f"価格詳細 - GMO買値:{gmo_ask_price}, GMO売値:{gmo_bid_price}, BB買値:{bitbank_bid_price}, BB売値:{bitbank_ask_price}")
             
             # 分析結果と統一した変数名
             gmo_to_bitbank_profit = arbitrage_1  # GMO買い→Bitbank売り
@@ -370,7 +389,14 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
             if self.offensive_mode and bitbank_position_size < self.base_qty and total_gmo_pos <= bitbank_position_size:
                 # 優先機会: GMO買い→Bitbank信用売り（分析結果で高収益）
                 if True and gmo_to_bitbank_profit > self.entry_threshold:  # 実取引有効化
-                    qty = min(float(bitbank_buy_order[0]["size"]), self.base_qty - bitbank_position_size)
+                    # 板情報から数量を取得
+                    if isinstance(bitbank_buy_order[0], list):
+                        # API仕様通りの[price, amount]配列形式
+                        bitbank_available_size = float(bitbank_buy_order[0][1])  # amount
+                    else:
+                        # pybottersが変換したオブジェクト形式
+                        bitbank_available_size = float(bitbank_buy_order[0]["size"]) 
+                    qty = min(bitbank_available_size, self.base_qty - bitbank_position_size)
                     
                     # GMOで買いポジション
                     await self.gmo.buy_in(gmo_ask_price, qty)
@@ -387,7 +413,14 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                     
                 # サブ機会: Bitbank買い→GMO信用売り（低収益だが機会あり）
                 elif True and bitbank_to_gmo_profit > self.entry_threshold and gmo_to_bitbank_profit <= self.entry_threshold:  # メイン機会がない場合のみ
-                    qty = min(float(bitbank_sell_order[0]["size"]), self.base_qty - bitbank_position_size)
+                    # 板情報から数量を取得
+                    if isinstance(bitbank_sell_order[0], list):
+                        # API仕様通りの[price, amount]配列形式
+                        bitbank_available_size = float(bitbank_sell_order[0][1])  # amount
+                    else:
+                        # pybottersが変換したオブジェクト形式
+                        bitbank_available_size = float(bitbank_sell_order[0]["size"])
+                    qty = min(bitbank_available_size, self.base_qty - bitbank_position_size)
                     
                     # GMOで売りポジション
                     await self.gmo.sell_in(gmo_bid_price, qty)
