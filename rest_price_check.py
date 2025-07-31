@@ -13,12 +13,20 @@ import csv
 import os
 from datetime import datetime
 
-# GMOコインとBitbankで共通対応している通貨ペア
-SUPPORTED_SYMBOLS = [
-    'BTC_JPY', 'ETH_JPY', 'XRP_JPY', 'LTC_JPY', 
-    'LINK_JPY', 'ADA_JPY', 'DOT_JPY', 'ATOM_JPY', 
-    'SOL_JPY', 'DOGE_JPY'
-]
+# GMOコインとBitbankで共通対応している通貨ペア（名前をマッピング）
+SUPPORTED_SYMBOLS = {
+    'BTC_JPY': 'btc_jpy',
+    'ETH_JPY': 'eth_jpy', 
+    'XRP_JPY': 'xrp_jpy',
+    'LTC_JPY': 'ltc_jpy',
+    'LINK_JPY': 'link_jpy',
+    'ADA_JPY': 'ada_jpy',
+    'DOT_JPY': 'dot_jpy',
+    'ATOM_JPY': 'atom_jpy',
+    'SOL_JPY': 'sol_jpy',
+    'DOGE_JPY': 'doge_jpy',
+    'BCH_JPY': 'bcc_jpy'  # BitbankではBCHがbcc_jpyとして表記
+}
 
 def get_gmo_ticker(symbol="BTC_JPY"):
     """GMOCoinのティッカー情報を取得"""
@@ -43,17 +51,17 @@ def get_gmo_ticker(symbol="BTC_JPY"):
 def get_gmo_all_tickers():
     """GMOCoinの全対応通貨のティッカー情報を取得"""
     tickers = {}
-    for symbol in SUPPORTED_SYMBOLS:
-        ticker = get_gmo_ticker(symbol)
+    for gmo_symbol in SUPPORTED_SYMBOLS.keys():
+        ticker = get_gmo_ticker(gmo_symbol)
         if ticker:
-            tickers[symbol] = ticker
+            tickers[gmo_symbol] = ticker
         time.sleep(0.1)  # レート制限対策
     return tickers
 
-def get_bitbank_ticker():
+def get_bitbank_ticker(symbol="btc_jpy"):
     """Bitbankのティッカー情報を取得"""
     try:
-        url = "https://public.bitbank.cc/btc_jpy/ticker"
+        url = f"https://public.bitbank.cc/{symbol}/ticker"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -62,11 +70,22 @@ def get_bitbank_ticker():
             return {
                 "bid": float(ticker["buy"]),   # 買値
                 "ask": float(ticker["sell"]),  # 売値
-                "timestamp": ticker["timestamp"]
+                "timestamp": ticker["timestamp"],
+                "symbol": symbol
             }
     except Exception as e:
-        print(f"Bitbank価格取得エラー: {e}")
+        print(f"Bitbank価格取得エラー ({symbol}): {e}")
     return None
+
+def get_bitbank_all_tickers():
+    """Bitbankの全対応通貨のティッカー情報を取得"""
+    tickers = {}
+    for gmo_symbol, bitbank_symbol in SUPPORTED_SYMBOLS.items():
+        ticker = get_bitbank_ticker(bitbank_symbol)
+        if ticker:
+            tickers[gmo_symbol] = ticker  # GMOのシンボル名で統一
+        time.sleep(0.1)  # レート制限対策
+    return tickers
 
 def get_csv_filename():
     """日別CSVファイル名を生成"""
@@ -74,7 +93,7 @@ def get_csv_filename():
     data_dir = 'data'
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
-    return os.path.join(data_dir, f'price_data_{today}.csv')
+    return os.path.join(data_dir, f'price_data_all_symbols_{today}.csv')
 
 def save_to_csv(data):
     """データをCSVファイルに保存"""
@@ -83,7 +102,7 @@ def save_to_csv(data):
     
     with open(filename, 'a', newline='', encoding='utf-8') as csvfile:
         fieldnames = [
-            'timestamp', 'datetime',
+            'timestamp', 'datetime', 'symbol',
             'gmo_bid', 'gmo_ask', 'gmo_spread',
             'bitbank_bid', 'bitbank_ask', 'bitbank_spread',
             'arbitrage_1', 'arbitrage_2', 'max_arbitrage'
@@ -97,83 +116,48 @@ def save_to_csv(data):
         # データを書き込み
         writer.writerow(data)
 
-def analyze_arbitrage_opportunity():
-    """アービトラージ機会を分析"""
-    print("=== GMO×Bitbank価格差チェック ===")
-    print(f"実行時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 価格データ取得
-    gmo_data = get_gmo_ticker()
-    bitbank_data = get_bitbank_ticker()
-    
-    if not gmo_data or not bitbank_data:
-        print("[エラー] 価格データの取得に失敗しました")
-        return
-    
-    print(f"\n[現在価格]")
-    print(f"GMO     - 買値: {gmo_data['bid']:,.0f}円, 売値: {gmo_data['ask']:,.0f}円")
-    print(f"Bitbank - 買値: {bitbank_data['bid']:,.0f}円, 売値: {bitbank_data['ask']:,.0f}円")
+def analyze_single_symbol(symbol, gmo_data, bitbank_data):
+    """単一シンボルのアービトラージ機会を分析"""
+    print(f"\n=== {symbol} ===")
+    print(f"GMO     - 買値: {gmo_data['bid']:,.1f}円, 売値: {gmo_data['ask']:,.1f}円")
+    print(f"Bitbank - 買値: {bitbank_data['bid']:,.1f}円, 売値: {bitbank_data['ask']:,.1f}円")
     
     # 価格差計算
-    # パターン1: GMOで買い、Bitbankで売り
-    arbitrage_1 = bitbank_data['bid'] - gmo_data['ask']
+    arbitrage_1 = bitbank_data['bid'] - gmo_data['ask']  # GMO買→Bitbank売
+    arbitrage_2 = gmo_data['bid'] - bitbank_data['ask']  # GMO売→Bitbank買
     
-    # パターン2: GMOで売り、Bitbankで買い  
-    arbitrage_2 = gmo_data['bid'] - bitbank_data['ask']
-    
-    print(f"\n[価格差分析]")
-    print(f"パターン1 (GMO買→Bitbank売): {arbitrage_1:+.1f}円")
-    print(f"パターン2 (GMO売→Bitbank買): {arbitrage_2:+.1f}円")
-    
-    # 約定機会判定
-    opportunities = []
-    
-    if arbitrage_1 > 500:
-        opportunities.append(f"*** 約定機会! パターン1: {arbitrage_1:.1f}円の利益機会")
-    elif arbitrage_1 > 200:
-        opportunities.append(f"** 注目! パターン1: {arbitrage_1:.1f}円の価格差")
-    elif arbitrage_1 > 0:
-        opportunities.append(f"* パターン1: {arbitrage_1:.1f}円の小さな価格差")
-    else:
-        opportunities.append(f"- パターン1: {arbitrage_1:.1f}円の逆価格差")
-    
-    if arbitrage_2 > 500:
-        opportunities.append(f"*** 約定機会! パターン2: {arbitrage_2:.1f}円の利益機会")
-    elif arbitrage_2 > 200:
-        opportunities.append(f"** 注目! パターン2: {arbitrage_2:.1f}円の価格差")
-    elif arbitrage_2 > 0:
-        opportunities.append(f"* パターン2: {arbitrage_2:.1f}円の小さな価格差")
-    else:
-        opportunities.append(f"- パターン2: {arbitrage_2:.1f}円の逆価格差")
-    
-    print(f"\n[約定機会評価]")
-    for opportunity in opportunities:
-        print(f"  {opportunity}")
-    
-    # スプレッド情報
+    # スプレッド計算
     gmo_spread = gmo_data['ask'] - gmo_data['bid']
     bitbank_spread = bitbank_data['ask'] - bitbank_data['bid']
     
-    print(f"\n[スプレッド情報]")
-    print(f"GMO: {gmo_spread:.1f}円")
-    print(f"Bitbank: {bitbank_spread:.1f}円")
-    
-    # 総合評価
+    # 最大価格差
     max_arbitrage = max(arbitrage_1, arbitrage_2)
-    if max_arbitrage > 500:
-        print(f"\n[結論] 約定機会あり! 最大{max_arbitrage:.1f}円の利益機会")
-    elif max_arbitrage > 200:
-        print(f"\n[結論] 要注目価格差! 最大{max_arbitrage:.1f}円の価格差")
-    elif max_arbitrage > 0:
-        print(f"\n[結論] 小さな価格差あり。最大{max_arbitrage:.1f}円")
-    else:
-        print(f"\n[結論] 現在約定機会なし")
     
-    # CSVデータ準備
-    current_time = datetime.now()
-    csv_data = {
-        'timestamp': current_time.timestamp(),
-        'datetime': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+    # 約定機会判定の閾値（価格に応じて調整）
+    if gmo_data['bid'] > 1000000:  # 100万円以上（BTC等）
+        thresholds = [500, 200]
+    elif gmo_data['bid'] > 100000:  # 10万円以上（ETH等）
+        thresholds = [50, 20]
+    elif gmo_data['bid'] > 1000:   # 1000円以上
+        thresholds = [10, 5]
+    else:                          # 1000円未満
+        thresholds = [1, 0.5]
+    
+    # 結果表示
+    status = ""
+    if max_arbitrage > thresholds[0]:
+        status = f"*** 約定機会! 最大{max_arbitrage:.1f}円"
+    elif max_arbitrage > thresholds[1]:
+        status = f"** 注目! 最大{max_arbitrage:.1f}円"
+    elif max_arbitrage > 0:
+        status = f"* 小差: 最大{max_arbitrage:.1f}円"
+    else:
+        status = f"- 逆差: 最大{max_arbitrage:.1f}円"
+    
+    print(f"価格差: {arbitrage_1:+.1f}円 / {arbitrage_2:+.1f}円 | {status}")
+    
+    return {
+        'symbol': symbol,
         'gmo_bid': gmo_data['bid'],
         'gmo_ask': gmo_data['ask'],
         'gmo_spread': gmo_spread,
@@ -184,18 +168,66 @@ def analyze_arbitrage_opportunity():
         'arbitrage_2': arbitrage_2,
         'max_arbitrage': max_arbitrage
     }
+
+def analyze_arbitrage_opportunity():
+    """全通貨ペアのアービトラージ機会を分析"""
+    print("=== GMO×Bitbank 全通貨価格差チェック ===")
+    print(f"実行時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # CSVに保存
-    save_to_csv(csv_data)
-    print(f"[データ保存] {get_csv_filename()}に保存しました")
+    # 全通貨の価格データ取得
+    print("\n[価格データ取得中...]")
+    gmo_tickers = get_gmo_all_tickers()
+    bitbank_tickers = get_bitbank_all_tickers()
     
-    return {
-        'gmo': gmo_data,
-        'bitbank': bitbank_data,
-        'arbitrage_1': arbitrage_1,
-        'arbitrage_2': arbitrage_2,
-        'max_arbitrage': max_arbitrage
-    }
+    if not gmo_tickers or not bitbank_tickers:
+        print("[エラー] 価格データの取得に失敗しました")
+        return
+    
+    print(f"GMO: {len(gmo_tickers)}通貨, Bitbank: {len(bitbank_tickers)}通貨")
+    
+    # 各通貨ペアを分析
+    results = []
+    current_time = datetime.now()
+    
+    for symbol in SUPPORTED_SYMBOLS.keys():
+        if symbol in gmo_tickers and symbol in bitbank_tickers:
+            result = analyze_single_symbol(symbol, gmo_tickers[symbol], bitbank_tickers[symbol])
+            
+            # CSVデータ準備
+            csv_data = {
+                'timestamp': current_time.timestamp(),
+                'datetime': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                **result
+            }
+            
+            # CSVに保存
+            save_to_csv(csv_data)
+            results.append(result)
+        else:
+            print(f"\n=== {symbol} ===")
+            print("データ取得失敗")
+    
+    # 総合結果表示
+    if results:
+        print(f"\n=== 総合結果 ===")
+        # 最大価格差でソート
+        sorted_results = sorted(results, key=lambda x: x['max_arbitrage'], reverse=True)
+        
+        print("最大価格差ランキング:")
+        for i, result in enumerate(sorted_results[:5], 1):
+            print(f"{i}. {result['symbol']}: {result['max_arbitrage']:+.1f}円")
+        
+        best_opportunity = sorted_results[0]['max_arbitrage']
+        if best_opportunity > 200:
+            print(f"\n[結論] 約定機会あり! 最大{best_opportunity:.1f}円の価格差")
+        elif best_opportunity > 50:
+            print(f"\n[結論] 要注目価格差! 最大{best_opportunity:.1f}円の価格差")
+        else:
+            print(f"\n[結論] 現在大きな約定機会なし")
+        
+        print(f"[データ保存] {get_csv_filename()}に保存しました")
+    
+    return results
 
 def continuous_monitoring(duration=None, interval=5):
     """継続的な監視"""
@@ -208,6 +240,7 @@ def continuous_monitoring(duration=None, interval=5):
     start_time = time.time()
     check_count = 0
     best_opportunity = 0
+    best_symbol = ""
     
     try:
         while True:
@@ -217,9 +250,13 @@ def continuous_monitoring(duration=None, interval=5):
             check_count += 1
             print(f"\n--- チェック {check_count} ---")
             
-            result = analyze_arbitrage_opportunity()
-            if result and result['max_arbitrage'] > best_opportunity:
-                best_opportunity = result['max_arbitrage']
+            results = analyze_arbitrage_opportunity()
+            if results:
+                # 最大価格差を更新
+                current_best = max(results, key=lambda x: x['max_arbitrage'])
+                if current_best['max_arbitrage'] > best_opportunity:
+                    best_opportunity = current_best['max_arbitrage']
+                    best_symbol = current_best['symbol']
             
             time.sleep(interval)
             
@@ -230,7 +267,7 @@ def continuous_monitoring(duration=None, interval=5):
     print(f"\n[監視結果サマリー]")
     print(f"実行時間: {elapsed_time/60:.1f}分")
     print(f"総チェック数: {check_count}回")
-    print(f"最大価格差: {best_opportunity:.1f}円")
+    print(f"最大価格差: {best_opportunity:.1f}円 ({best_symbol})")
     print(f"データファイル: {get_csv_filename()}")
 
 if __name__ == '__main__':
