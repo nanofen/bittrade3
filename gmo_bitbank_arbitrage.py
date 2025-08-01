@@ -394,8 +394,8 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                         # API仕様通りの[price, amount]配列形式
                         bitbank_available_size = float(bitbank_buy_order[0][1])  # amount
                     else:
-                        # pybottersが変換したオブジェクト形式
-                        bitbank_available_size = float(bitbank_buy_order[0]["size"]) 
+                        # pybottersが変換したオブジェクト形式（amountキーを使用）
+                        bitbank_available_size = float(bitbank_buy_order[0]["amount"]) 
                     qty = min(bitbank_available_size, self.base_qty - bitbank_position_size)
                     
                     # GMOで買いポジション
@@ -419,7 +419,7 @@ class GMOBitbankArbitrageBot(bybitbot_base.BybitBotBase):
                         bitbank_available_size = float(bitbank_sell_order[0][1])  # amount
                     else:
                         # pybottersが変換したオブジェクト形式
-                        bitbank_available_size = float(bitbank_sell_order[0]["size"])
+                        bitbank_available_size = float(bitbank_sell_order[0]["amount"])
                     qty = min(bitbank_available_size, self.base_qty - bitbank_position_size)
                     
                     # GMOで売りポジション
